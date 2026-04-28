@@ -89,6 +89,13 @@ function normalizeMinuteTimestamp(timestamp) {
   return date.getTime();
 }
 
+// 判断 filterAfterTimestamp 是否可靠（不能太早，如果太早说明是 fallback 到 flowStartTime，不可靠）
+function isFilterAfterTimestampReliable(filterAfterMinute) {
+  if (!filterAfterMinute) return false;
+  const oneHourAgo = Date.now() - 60 * 60 * 1000;
+  return filterAfterMinute > oneHourAgo;
+}
+
 function parseMail163Timestamp(rawText) {
   const text = (rawText || '').replace(/\s+/g, ' ').trim();
   if (!text) return null;
@@ -196,7 +203,57 @@ async function handlePollEmail(step, payload) {
     throw new Error('163 邮箱列表未加载完成，请确认当前已打开收件箱。');
   }
 
-  log(`步骤 ${step}：邮件列表已加载，共 ${items.length} 封邮件`);
+  // 如果有旧邮件，先清空收件箱避免干扰
+  if (items.length > 0) {
+    log(`步骤 ${step}：发现 ${items.length} 封旧邮件，正在全选删除...`);
+    try {
+      // 点击全选按钮
+      const selectAllBtn = document.querySelector('[title="全选"], #fly2');
+      if (selectAllBtn) {
+        selectAllBtn.click();
+        await sleep(500);
+
+        // 点击删除按钮（XPath 方式）
+        const deleteBtn = document.evaluate(
+          "//span[normalize-space(text())='删 除']",
+          document,
+          null,
+          XPathResult.FIRST_ORDERED_NODE_TYPE,
+          null
+        ).singleNodeValue;
+        if (deleteBtn) {
+          deleteBtn.click();
+          log(`步骤 ${step}：已点击删除按钮`);
+          await sleep(2000);
+
+          // 删除后再次检查是否还有邮件
+          const remainingItems = findMailItems();
+          if (remainingItems.length > 0) {
+            log(`步骤 ${step}：删除后仍有 ${remainingItems.length} 封邮件，尝试再次删除...`);
+            // 再次全选删除
+            const selectAllBtn2 = document.querySelector('[title="全选"], #fly2');
+            if (selectAllBtn2) selectAllBtn2.click();
+            await sleep(500);
+            const deleteBtn2 = document.evaluate(
+              "//span[normalize-space(text())='删 除']",
+              document,
+              null,
+              XPathResult.FIRST_ORDERED_NODE_TYPE,
+              null
+            ).singleNodeValue;
+            if (deleteBtn2) deleteBtn2.click();
+            await sleep(2000);
+          }
+        }
+      }
+    } catch (err) {
+      log(`步骤 ${step}：清空旧邮件失败，继续执行：${err.message}`, 'warn');
+    }
+  }
+
+  // 再次确认邮件列表已清空
+  const finalItems = findMailItems();
+  log(`步骤 ${step}：邮件列表已加载，共 ${finalItems.length} 封邮件`);
 
   // Snapshot existing mail IDs
   const existingMailIds = getCurrentMailIds();
@@ -220,7 +277,9 @@ async function handlePollEmail(step, payload) {
       const mailTimestamp = getMailTimestamp(item);
       const mailMinute = normalizeMinuteTimestamp(mailTimestamp || 0);
       const passesTimeFilter = !filterAfterMinute || (mailMinute && mailMinute >= filterAfterMinute);
-      const shouldBypassOldSnapshot = Boolean(filterAfterMinute && passesTimeFilter && mailMinute > 0);
+      // filterAfterTimestamp 不可靠时（如 fallback 到 flowStartTime），不启用时间绕过逻辑，避免旧邮件被误认为新邮件
+      const filterAfterReliable = isFilterAfterTimestampReliable(filterAfterMinute);
+      const shouldBypassOldSnapshot = filterAfterReliable && passesTimeFilter && mailMinute > 0;
 
       if (!passesTimeFilter) {
         continue;
@@ -249,13 +308,21 @@ async function handlePollEmail(step, payload) {
           const source = useFallback && existingMailIds.has(id) ? '回退匹配邮件' : '新邮件';
           const timeLabel = mailTimestamp ? `，时间：${new Date(mailTimestamp).toLocaleString('zh-CN', { hour12: false })}` : '';
           log(`步骤 ${step}：已找到验证码：${code}（来源：${source}${timeLabel}，主题：${subject.slice(0, 40)}）`, 'ok');
-
-          // Trigger cleanup only as a best-effort side effect.
           scheduleEmailCleanup(item, step);
-
           return { ok: true, code, emailTimestamp: Date.now(), mailId: id };
         } else if (code && seenCodes.has(code)) {
           log(`步骤 ${step}：跳过已处理过的验证码：${code}`, 'info');
+        } else {
+          // 标题/ariaLabel 中提取不到验证码，点击邮件从 iframe 正文获取
+          const bodyCode = await extractCodeFromMailBody(item, step);
+          if (bodyCode && !excludedCodeSet.has(bodyCode) && !seenCodes.has(bodyCode)) {
+            seenCodes.add(bodyCode);
+            persistSeenCodes();
+            const source = useFallback && existingMailIds.has(id) ? '回退匹配邮件' : '新邮件(正文)';
+            const timeLabel = mailTimestamp ? `，时间：${new Date(mailTimestamp).toLocaleString('zh-CN', { hour12: false })}` : '';
+            log(`步骤 ${step}：已找到验证码：${bodyCode}（来源：${source}${timeLabel}，主题：${subject.slice(0, 40)}）`, 'ok');
+            return { ok: true, code: bodyCode, emailTimestamp: Date.now(), mailId: id };
+          }
         }
       }
     }
@@ -364,6 +431,78 @@ async function refreshInbox() {
 // ============================================================
 // Verification Code Extraction
 // ============================================================
+
+// 点击邮件正文获取验证码（163邮箱邮件内容在iframe中）
+// 遍历所有 iframe，排除已使用的验证码，返回新验证码
+async function extractCodeFromMailBody(item, step) {
+  try {
+    log(`步骤 ${step}：标题中无验证码，点击邮件正文...`);
+
+    item.click();
+    await sleep(1500);
+
+    // 获取所有 iframe[id$="_frameBody"]
+    const allIframes = document.querySelectorAll('iframe[id$="_frameBody"]');
+    log(`步骤 ${step}：当前有 ${allIframes.length} 个 iframe 详情页`);
+
+    let foundCode = null;
+    for (const iframe of allIframes) {
+      const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
+      if (!iframeDoc) continue;
+
+      const bodyText = iframeDoc.body?.innerText || iframeDoc.body?.textContent || '';
+
+      // 先尝试精确匹配（中文验证码格式）
+      let code = null;
+      const matchCn = bodyText.match(/(?:代码为|验证码[^0-9]*?)[\s：:]*(\d{6})/);
+      if (matchCn) {
+        code = matchCn[1];
+      } else {
+        const match6 = bodyText.match(/\b(\d{6})\b/);
+        if (match6) code = match6[1];
+      }
+
+      if (code) {
+        // 排除 step4 已使用过的验证码
+        if (seenCodes.has(code)) {
+          log(`步骤 ${step}：iframe 中跳过已处理过的验证码：${code}`, 'info');
+          continue;
+        }
+        foundCode = code;
+        log(`步骤 ${step}：从 iframe 中提取到新验证码：${code}`, 'info');
+        break;
+      }
+    }
+
+    if (!foundCode) {
+      log(`步骤 ${step}：所有 iframe 中都未找到新验证码`, 'warn');
+    }
+
+    // 返回收件箱列表
+    await goBackToInbox();
+    await sleep(500);
+
+    return foundCode;
+  } catch (err) {
+    console.warn(MAIL163_PREFIX, 'extractCodeFromMailBody failed:', err?.message || err);
+    try {
+      await goBackToInbox();
+    } catch {}
+    return null;
+  }
+}
+
+// 返回收件箱列表（不清除 iframe，由 background 在下次轮询前统一刷新页面）
+async function goBackToInbox() {
+  try {
+    const inboxLink = await waitForElement('.nui-tree-item-text[title="收件箱"]', 3000);
+    inboxLink.click();
+    await sleep(1500);
+  } catch {
+    history.back();
+    await sleep(1000);
+  }
+}
 
 function extractVerificationCode(text) {
   const matchCn = text.match(/(?:代码为|验证码[^0-9]*?)[\s：:]*(\d{6})/);

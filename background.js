@@ -240,7 +240,7 @@ const PERSISTED_SETTING_KEYS = Object.keys(PERSISTED_SETTING_DEFAULTS);
 const ACCOUNT_RUN_HISTORY_STORAGE_KEY = 'accountRunHistory';
 const SETTINGS_EXPORT_SCHEMA_VERSION = 1;
 const SETTINGS_EXPORT_FILENAME_PREFIX = 'multipage-settings';
-const STEP6_PRE_LOGIN_COOKIE_CLEAR_DELAY_MS = 10000;
+const STEP6_PRE_LOGIN_COOKIE_CLEAR_DELAY_MS = 15000;
 const HERO_SMS_PHONE_MAX_USAGE_RETRY_LIMIT = 3;
 const HERO_SMS_FAILED_ACTIVATION_CLEANUP_DELAY_MS = 2 * 60 * 1000;
 const HERO_SMS_FAILED_ACTIVATION_ALARM_PREFIX = 'hero-sms-failed-cleanup:';
@@ -1443,6 +1443,13 @@ async function heroSmsGetStatus(config, activationId) {
   return parseHeroSmsStatusResponse(text);
 }
 
+// 获取 V2 状态详情（包含 canGetAnotherSms 等字段）
+async function heroSmsGetStatusV2(config, activationId) {
+  const payload = await requestHeroSmsPayload(config, 'getStatusV2', { id: activationId });
+  // 返回结构化数据，包含 smsCount、canGetAnotherSms 等
+  return payload;
+}
+
 async function heroSmsSetStatus(config, activationId, status) {
   return requestHeroSmsText(config, 'setStatus', { id: activationId, status });
 }
@@ -1795,15 +1802,42 @@ async function ensureHeroSmsActivationForFlow(state, options = {}) {
   const currentActivation = getCurrentHeroSmsActivation(currentState);
 
   if (currentActivation && isHeroSmsActivationReusable(currentState, currentActivation)) {
-    return currentActivation;
+    // 复用前检查 API 的 canGetAnotherSms 状态
+    try {
+      const v2Status = await heroSmsGetStatusV2(config, currentActivation.activationId);
+      const canGetAnother = String(v2Status?.canGetAnotherSms || '1').trim();
+      const smsCount = Number(v2Status?.smsCount || 0);
+
+      // canGetAnotherSms = "0" 表示不能再接收短信，或者短信次数超过 3 次，释放并获取新号
+      if (canGetAnother === '0' || smsCount > 3) {
+        await addLog(`HeroSMS：号码 ${currentActivation.phoneNumber} 已无法接收更多短信（canGetAnotherSms=${canGetAnother}, smsCount=${smsCount}），将释放并获取新号`, 'warn');
+        currentActivation = null;  // 触发释放逻辑
+      } else {
+        return currentActivation;  // 号码可用，直接复用
+      }
+    } catch (err) {
+      // 如果查询失败，默认放行复用（避免因 API 错误阻断流程）
+      await addLog(`HeroSMS：查询号码状态失败，继续复用：${err.message}`, 'warn');
+      return currentActivation;
+    }
   }
 
   if (currentActivation) {
-    await finalizeHeroSmsActivation(currentState, {
+    const finalizeResult = await finalizeHeroSmsActivation(currentState, {
       preferComplete: currentActivation.useCount >= HERO_SMS_NUMBER_MAX_USES,
       releaseReason: currentActivation.useCount >= HERO_SMS_NUMBER_MAX_USES ? 'max_uses_reached' : 'expired_or_replaced',
       silent: false,
     });
+
+    // 释放失败但号码仍可能有效（如收到OTP但无法释放），检查状态后决定是否复用
+    if (!finalizeResult.released && finalizeResult.error) {
+      const errorText = String(finalizeResult.error?.message || finalizeResult.error || '');
+      // OTP_RECEIVED 错误说明号码有验证码，可以继续使用
+      if (/otp[_\-]?received/i.test(errorText) && currentActivation.useCount < HERO_SMS_NUMBER_MAX_USES) {
+        await addLog(`HeroSMS：释放号码 ${currentActivation.phoneNumber} 失败但已收到OTP，继续使用该号码`, 'warn');
+        return currentActivation;
+      }
+    }
   }
 
   const standbyActivation = await takeReusableHeroSmsStandbyActivation(currentState);
@@ -7125,18 +7159,41 @@ async function handleStepData(step, payload) {
         const expired = getHeroSmsActivationRemainingMs(updatedActivation) <= 0;
 
         if (nextUseCount >= HERO_SMS_NUMBER_MAX_USES || expired) {
-          await addLog(
-            `HeroSMS：号码 ${updatedActivation.phoneNumber} 已成功使用 ${nextUseCount}/${HERO_SMS_NUMBER_MAX_USES} 次，准备${nextUseCount >= HERO_SMS_NUMBER_MAX_USES ? '完成激活' : '释放号码'}。`,
-            'ok'
-          );
-          await finalizeHeroSmsActivation(
-            { ...latestState, currentHeroSmsActivation: updatedActivation },
-            {
-              preferComplete: nextUseCount >= HERO_SMS_NUMBER_MAX_USES,
-              releaseReason: nextUseCount >= HERO_SMS_NUMBER_MAX_USES ? 'max_uses_reached' : 'expired_after_success',
-              silent: false,
+          // 先检查 canGetAnotherSms 状态，如果 API 说不能再接收短信了，说明已完成使命，不需要再 finalize
+          let needsFinalize = true;
+          try {
+            const v2Status = await heroSmsGetStatusV2(config, updatedActivation.activationId);
+            const canGetAnother = String(v2Status?.canGetAnotherSms || '1').trim();
+            const smsCount = Number(v2Status?.smsCount || 0);
+            if (canGetAnother === '0' || smsCount > 3) {
+              await addLog(`HeroSMS：号码 ${updatedActivation.phoneNumber} 已完成使命（canGetAnotherSms=${canGetAnother}, smsCount=${smsCount})，无需释放。`, 'ok');
+              needsFinalize = false;
             }
-          );
+          } catch {
+            // 查询失败，默认继续释放
+          }
+
+          if (needsFinalize) {
+            await addLog(
+              `HeroSMS：号码 ${updatedActivation.phoneNumber} 已成功使用 ${nextUseCount}/${HERO_SMS_NUMBER_MAX_USES} 次，准备${nextUseCount >= HERO_SMS_NUMBER_MAX_USES ? '完成激活' : '释放号码'}。`,
+              'ok'
+            );
+            const finalizeResult = await finalizeHeroSmsActivation(
+              { ...latestState, currentHeroSmsActivation: updatedActivation },
+              {
+                preferComplete: nextUseCount >= HERO_SMS_NUMBER_MAX_USES,
+                releaseReason: nextUseCount >= HERO_SMS_NUMBER_MAX_USES ? 'max_uses_reached' : 'expired_after_success',
+                silent: false,
+              }
+            );
+            // 释放失败但号码已完成使命（OTP_RECEIVED），不报错
+            if (!finalizeResult.released && finalizeResult.error) {
+              const errorText = String(finalizeResult.error?.message || finalizeResult.error || '');
+              if (/otp[_\-]?received/i.test(errorText)) {
+                await addLog(`HeroSMS：号码 ${updatedActivation.phoneNumber} 已完成使命（API 限制无法操作），继续流程。`, 'ok');
+              }
+            }
+          }
         } else {
           await addLog(
             `HeroSMS：号码 ${updatedActivation.phoneNumber} 已累计成功注册 ${nextUseCount}/${HERO_SMS_NUMBER_MAX_USES} 次，剩余 ${HERO_SMS_NUMBER_MAX_USES - nextUseCount} 次可复用。`,
@@ -7748,7 +7805,7 @@ let autoRunAttemptRun = 0;
 const EMAIL_FETCH_MAX_ATTEMPTS = 5;
 const VERIFICATION_POLL_MAX_ROUNDS = 5;
 const STANDARD_MAIL_VERIFICATION_RESEND_INTERVAL_MS = 25000;
-const MAIL_2925_VERIFICATION_MAX_ATTEMPTS = 15;
+const MAIL_2925_VERIFICATION_MAX_ATTEMPTS = 10;
 const MAIL_2925_VERIFICATION_INTERVAL_MS = 15000;
 const AUTO_STEP_DELAYS = {
   1: 2000,
@@ -10473,7 +10530,45 @@ async function handleHeroSmsPhonePageDuringStep8(tabId) {
             if (backResult?.ready) {
               await addLog('步骤 8：已后退回手机号填写页，准备重新申请新号码。', 'warn');
             } else {
-              await addLog('步骤 8：已尝试后退回手机号填写页，但页面仍在切换，下一轮将继续申请新号码。', 'warn');
+              await addLog('步骤 8：已尝试后退回手机号填写页，但页面仍在切换，正在等待页面稳定...', 'warn');
+              await sleepWithStop(2000);
+              const pageState = await getStep8PageState(tabId);
+              if (pageState?.addPhonePage) {
+                await addLog('步骤 8：页面仍处于手机号验证页，再次尝试后退...', 'warn');
+                const retryBackResult = await goBackToPhoneNumberEntryOnPage(tabId);
+                if (retryBackResult?.ready) {
+                  await addLog('步骤 8：第二次后退成功，页面已回到手机号填写页。', 'warn');
+                } else {
+                  await addLog('步骤 8：第二次后退仍失败，启用兜底方案：直接 history.back()...', 'warn');
+                  try {
+                    await sendToContentScriptResilient('signup-page', {
+                      type: 'FORCE_HISTORY_BACK',
+                      source: 'background',
+                      payload: {},
+                    }, {
+                      timeoutMs: 10000,
+                      retryDelayMs: 500,
+                    });
+                    await sleepWithStop(2000);
+                    const pageStateAfterBack = await getStep8PageState(tabId);
+                    if (pageStateAfterBack?.addPhonePage) {
+                      await addLog('步骤 8：兜底 history.back() 成功，页面已回到手机号填写页。', 'warn');
+                    } else {
+                      await addLog('步骤 8：history.back() 后页面状态异常，尝试直接导航到手机号页面...', 'warn');
+                      await chrome.tabs.update(tabId, { url: 'https://auth.openai.com/add-phone' });
+                      await sleepWithStop(3000);
+                    }
+                  } catch (fallbackErr) {
+                    await addLog(`步骤 8：兜底方案也失败：${fallbackErr.message}，尝试直接导航到手机号页面...`, 'warn');
+                    await chrome.tabs.update(tabId, { url: 'https://auth.openai.com/add-phone' });
+                    await sleepWithStop(3000);
+                  }
+                }
+              } else if (pageState === null || pageState === undefined) {
+                await addLog('步骤 8：页面状态未知，可能正在跳转，尝试直接导航到手机号页面...', 'warn');
+                await chrome.tabs.update(tabId, { url: 'https://auth.openai.com/add-phone' });
+                await sleepWithStop(3000);
+              }
             }
           }
         } catch (retryErr) {

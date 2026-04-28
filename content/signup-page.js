@@ -31,6 +31,7 @@ if (document.documentElement.getAttribute(SIGNUP_PAGE_LISTENER_SENTINEL) !== '1'
       || message.type === 'RESEND_PHONE_VERIFICATION_CODE'
       || message.type === 'CLICK_PHONE_VERIFICATION_RETRY'
       || message.type === 'GO_BACK_TO_PHONE_NUMBER_ENTRY'
+      || message.type === 'FORCE_HISTORY_BACK'
     ) {
       resetStopState();
       handleCommand(message).then((result) => {
@@ -104,6 +105,8 @@ async function handleCommand(message) {
       return await clickPhoneVerificationRetry(message.payload);
     case 'GO_BACK_TO_PHONE_NUMBER_ENTRY':
       return await goBackToPhoneNumberEntry(message.payload);
+    case 'FORCE_HISTORY_BACK':
+      return await forceHistoryBack();
     case 'STEP8_FIND_AND_CLICK':
       return await step8_findAndClick();
     case 'STEP8_GET_STATE':
@@ -1893,6 +1896,31 @@ async function goBackToPhoneNumberEntry(_payload = {}) {
     hasCodeTarget: Boolean(latestSnapshot.codeTarget),
     errorText: latestSnapshot.errorText || '',
     url: latestSnapshot.url || location.href,
+  };
+}
+
+async function forceHistoryBack() {
+  history.back();
+  log('强制后退：已执行 history.back()');
+  await sleep(2000);
+
+  const snapshot = inspectPhoneVerificationState();
+  if (snapshot.phoneInput) {
+    return {
+      navigated: true,
+      ready: true,
+      hasPhoneInput: true,
+      url: snapshot.url || location.href,
+    };
+  }
+
+  return {
+    navigated: true,
+    ready: false,
+    hasPhoneInput: Boolean(snapshot.phoneInput),
+    hasCodeTarget: Boolean(snapshot.codeTarget),
+    errorText: snapshot.errorText || '',
+    url: snapshot.url || location.href,
   };
 }
 

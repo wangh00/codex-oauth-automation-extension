@@ -288,6 +288,14 @@ async function refreshInbox() {
   if (inboxLink) {
     simulateClick(inboxLink);
     await sleepRandom(700, 1200);
+    return;
+  }
+
+  // 没有刷新按钮也没有收件箱链接，直接导航到邮件列表页
+  const targetUrl = 'https://2925.com/#/mailList';
+  if (window.location.href !== targetUrl) {
+    window.location.href = targetUrl;
+    await sleepRandom(1500, 2500);
   }
 }
 
